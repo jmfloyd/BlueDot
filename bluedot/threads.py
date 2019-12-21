@@ -42,7 +42,6 @@ class WrapThread(Thread):
             t.stop()
 
     def start(self):
-        print(_Inc_TCount())
         self.stopping.clear()
         _THREADS.add(self)
         print("Starting Thread",self.name)
