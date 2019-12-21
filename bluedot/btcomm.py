@@ -1,15 +1,20 @@
 from __future__ import unicode_literals
 
 import socket
+import os
 import sys
 import errno
+from time import sleep
 
 from .utils import (
-    register_spp,
+    SPP,
+    Profile,
     get_mac,
     get_adapter_powered_status,
     get_adapter_discoverable_status,
     get_adapter_pairable_status,
+    find_device,
+    get_device_property,
     get_paired_devices,
     device_pairable,
     device_discoverable,
@@ -225,6 +230,7 @@ class BluetoothServer(object):
         self._client_sock = None
 
         self._conn_thread = None
+        self._was_connected = False
 
         if auto_start:
             self.start()
@@ -328,7 +334,72 @@ class BluetoothServer(object):
 
     @when_client_disconnects.setter
     def when_client_disconnects(self, value):
+
         self._when_client_disconnects = value
+
+    def conn_status(self, stopping=None, debug=False):
+
+        # check spp connection in continuous loop thread
+        # this runs in its own thread
+        while True:
+            if stopping.is_set():
+                break
+
+            self.conn_device = self.spp_server.get_conn_device()
+#            print("Conn Dev 1",self.conn_device)
+#            if self.conn_device is not None:
+#                # check if BT connectedness
+#                try:
+#                    self.dbus_device = find_device(self.conn_device,
+#                        adapter=self._adapter._device)
+#                    connected = get_device_property(self.dbus_device,'Connected',bool)
+#                except Exception as msg:
+#                    print('Property error:',msg)
+#                    self.conn_device = None
+
+            if self.conn_device is None:
+                connected = False
+            else:
+                try:
+                    # handle a BT error
+                    self.dbus_device = find_device(self.conn_device,
+                        adapter=self._adapter._device)
+                    connected = get_device_property(self.dbus_device,'Connected',bool)
+#                    print("  -> connected",connected)
+                except Exception as msg:
+                    print("Error:",msg)
+                    connected = False
+                finally:
+                    self.dbus_name = get_device_property(self.dbus_device,
+                                                         'Name',str)
+
+                if not self._client_connected and connected:
+                    # connection occurs
+                    self._client_connected = True
+                    print('Connected Device',self.conn_device)
+                    print("          DevName {}".format(self.dbus_name))
+                    #call the call back
+                    self._when_client_connects()
+
+
+            if not connected:
+                self._client_connected = False
+                self.conn_device = None
+                if self._was_connected:
+                    self._when_client_disconnects()
+
+            self._was_connected = connected
+
+            sleep(1)
+
+
+    def read_cb(self,value):
+        print('read callback: {}'.format(value))
+
+    def send(self,data):
+        if self.spp_server.fd_available():
+            self.spp_server.send(data)
+        return True
 
     def start(self):
         """
@@ -344,11 +415,25 @@ class BluetoothServer(object):
                 raise Exception("Bluetooth device {} is turned off".format(self.adapter.device))
 
             #register the serial port profile with Bluetooth
-            register_spp(self._port)
+            #register_spp(self._port)
+            # new  version using its own thread
+            #    that stays alive for the full session operating dbus callback
+            #    methods.
+            #    creates its own fd
 
+            self.spp_server = SPP(read_cb=self.read_cb, debug=False)
+            self.profile = WrapThread(target=self.spp_server.start,
+                                      name='BTSPP')
+            self.profile.start()
+#            self.spp_server.start()
+
+            self._conn_thread = WrapThread(target=
+                                      self.conn_status,name='CONNECT').start()
             #start Bluetooth server
             #open the Bluetooth socket
-            self._server_sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+            '''
+            self._server_sock = socket.socket(socket.AF_BLUETOOTH,
+                                              socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
             self._server_sock.settimeout(BLUETOOTH_TIMEOUT)
             try:
                 self._server_sock.bind((self.server_address, self.port))
@@ -361,6 +446,7 @@ class BluetoothServer(object):
             #wait for client connection
             self._conn_thread = WrapThread(target=self._wait_for_connection)
             self._conn_thread.start()
+            '''
 
             self._running = True
 
@@ -381,8 +467,8 @@ class BluetoothServer(object):
             The data to be sent.
         """
         if self._client_connected:
-            if self._encoding is not None:
-                data = data.encode(self._encoding)
+#            if self._encoding is not None:
+#                data = data.encode(self._encoding)
             try:
                 self._send_data(data)
             except IOError as e:
@@ -391,81 +477,31 @@ class BluetoothServer(object):
     def _send_data(self, data):
         """
         Send raw data to the client.
-        
+
         :param bytes data:
             The data to be sent.
         """
-        self._client_sock.send(data)
+        self.spp_server.send(data)
+#        self._client_sock.send(data)
 
     def disconnect_client(self):
         """
         Disconnects the client if connected. Returns `True` if a client was disconnected.
         """
-        if self._client_connected:    
+        if self._client_connected:
             self._client_connected = False
-            
+
             # call the callback
-            if self.when_client_disconnects:
-                WrapThread(target=self.when_client_disconnects).start()
-            
+            if self._when_client_disconnects:
+                self._when_client_disconnects()
+
             return True
-        
+
         else:
             return False
 
     def _setup_adapter(self, device):
         self._adapter = BluetoothAdapter(device)
-    
-    def _wait_for_connection(self):
-        #keep going until the server is stopped
-        while not self._conn_thread.stopping.is_set():
-            #wait for connection
-            self._client_connected = False
-            while not self._conn_thread.stopping.is_set():
-                try:
-                    # accept() will timeout after BLUETOOTH_TIMEOUT seconds
-                    self._client_sock, self._client_info = self._server_sock.accept()
-                    self._client_connected = True
-                    break
-                except socket.timeout as e:
-                    self._handle_bt_error(e)
-
-            #did a client connect?
-            if self._client_connected:
-                #call the call back
-                if self.when_client_connects:
-                    WrapThread(target=self.when_client_connects).start()
-
-                #read data
-                self._read()
-
-        #server has been stopped
-        self._server_sock.close()
-        self._server_sock = None
-        self._running = False
-
-    def _read(self):
-        #read until the server is stopped or the client disconnects
-        while self._client_connected:
-            #read data from Bluetooth socket
-            try:
-                data = self._client_sock.recv(1024, socket.MSG_DONTWAIT)
-            except IOError as e:
-                self._handle_bt_error(e)
-                data = b""
-            if data:
-                if self._data_received_callback:
-                    if self._encoding:
-                        data = data.decode(self._encoding)
-                    self.data_received_callback(data)
-            if self._conn_thread.stopping.wait(BLUETOOTH_TIMEOUT):
-                break
-
-        #close the client socket
-        self._client_sock.close()
-        self._client_sock = None
-        self._client_info = None
-        self._client_connected = False
 
     def _handle_bt_error(self, bt_error):
         assert isinstance(bt_error, IOError)
@@ -699,7 +735,7 @@ class BluetoothClient():
     def _send_data(self, data):
         """
         Send raw data to the client.
-        
+
         :param bytes data:
             The data to be sent.
         """
@@ -725,7 +761,7 @@ class BluetoothClient():
 
     def _setup_adapter(self, device):
         self._adapter = BluetoothAdapter(device)
-    
+
     def _handle_bt_error(self, bt_error):
         assert isinstance(bt_error, IOError)
         #'resource unavailable' is when data cannot be read because there is nothing in the buffer

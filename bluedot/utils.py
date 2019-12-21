@@ -1,8 +1,17 @@
 from __future__ import unicode_literals
 
 import dbus
+import dbus.service
+import dbus.mainloop.glib
+from gi.repository import GLib
+
 import time
 import sys
+import os
+
+from dbus.mainloop.glib import DBusGMainLoop
+DBusGMainLoop(set_as_default=True)
+
 
 SERVICE_NAME = "org.bluez"
 ADAPTER_INTERFACE = SERVICE_NAME + ".Adapter1"
@@ -48,6 +57,23 @@ def get_adapter_discoverable_status(device_name):
 def get_adapter_pairable_status(device_name):
     pairable = get_adapter_property(device_name, "Pairable")
     return bool(pairable)
+
+def find_device(device_name,adapter='hci0'):
+    bus = dbus.SystemBus()
+#    dpath='/'.join((find_adapter(adapter).object_path,device_name))
+#    print('dpath',dpath)
+    device_object = bus.get_object(SERVICE_NAME, device_name)
+    device = dbus.Interface(device_object, DEVICE_INTERFACE)
+#    print('find_device',device)
+    return device
+
+def get_device_property(device, prop, ptype=ascii):
+    device_properties = dbus.Interface(device, "org.freedesktop.DBus.Properties")
+    return ptype(device_properties.Get(DEVICE_INTERFACE, prop))
+
+def get_device_connected_status(device_name):
+    value = get_adapter_property(device_name, "Connected")
+    return bool(value)
 
 def get_paired_devices(device_name):
     paired_devices = []
@@ -129,7 +155,10 @@ def register_spp(port):
 
     bus = dbus.SystemBus()
 
-    manager = dbus.Interface(bus.get_object(SERVICE_NAME, "/org/bluez"), PROFILE_MANAGER)
+    manager = dbus.Interface(bus.get_object(SERVICE_NAME, "/org/bluez"),
+                             PROFILE_MANAGER)
+
+    print("Setting up Profile")
 
     path = "/bluez"
     uuid = "00001101-0000-1000-8000-00805f9b34fb"
@@ -144,3 +173,128 @@ def register_spp(port):
         #the spp profile has already been registered, ignore
         if str(e) != "org.bluez.Error.AlreadyExists: Already Exists":
             raise(e)
+
+'''
+Creates a profile class with call backs and dbus methods
+SPP class creates the profile and runs in its own thread till killed
+'''
+
+
+class Profile(dbus.service.Object):
+    fd = -1
+
+    def __init__(self, bus, path, read_cb=None, debug=False):
+        self.read_io_cb = read_cb
+        self.conn_device = None
+        self.debug=debug
+        dbus.service.Object.__init__(self, bus, path)
+
+    @dbus.service.method('org.bluez.Profile1',
+                         in_signature='',
+                         out_signature='')
+    def Release(self):
+        print('Release')
+        mainloop.quit()
+
+    @dbus.service.method('org.bluez.Profile1',
+                         in_signature='oha{sv}',
+                         out_signature='')
+    def NewConnection(self, path, fd, properties):
+        self.fd = fd.take()
+#        print('NewConnection(dev %s, fh %d)' % (path, self.fd))
+        self.conn_device = path
+        io_id = GLib.io_add_watch(self.fd,
+                                     GLib.PRIORITY_DEFAULT,
+                                     GLib.IO_IN | GLib.IO_PRI,
+                                     self.io_cb)
+
+
+    @dbus.service.method('org.bluez.Profile1',
+                         in_signature='o',
+                         out_signature='')
+    def RequestDisconnection(self, path):
+        print('RequestDisconnection(%s)' % (path))
+
+        if self.fd > 0:
+            os.close(self.fd)
+            self.fd = -1
+
+    def io_cb(self, fd, conditions):
+        try:
+            if self.fd>-1:
+                data = os.read(fd, 1024)
+                self.read_io_cb(data.decode('ascii'))
+                if self.debug:
+                    print('reading',data)
+                return True
+        except ConnectionResetError:
+            print("Disconnect found on read")
+            self.fd = -1
+            self.conn_device = None
+
+    def write_io(self, value):
+        try:
+            if self.fd>-1:
+                os.write(self.fd, value.encode('utf8'))
+            else:
+                raise ConnectionResetError
+        except ConnectionResetError:
+            print("Disconnect found on send")
+            self.fd = -1
+            self.conn_device = None
+
+
+class SPP:
+
+    def __init__(self, read_cb=None, debug=False):
+        self.profile = None
+        self.debug=debug
+        bus = dbus.SystemBus()
+        manager = dbus.Interface(bus.get_object(SERVICE_NAME,
+                                                '/org/bluez'),
+                                 PROFILE_MANAGER)
+
+        self.mainloop = GLib.MainLoop()
+        adapter_props = dbus.Interface(bus.get_object(SERVICE_NAME,
+                                                      '/org/bluez/hci0'),
+                                       'org.freedesktop.DBus.Properties')
+        adapter_props.Set(ADAPTER_INTERFACE, 'Powered', dbus.Boolean(1))
+        profile_path = '/bluez'
+        server_uuid = '00001101-0000-1000-8000-00805f9b34fb'
+        opts = {
+            'AutoConnect': True,
+            'Role': 'server',
+            'Channel': dbus.UInt16(1),
+            'Name': 'BattMon'
+        }
+
+        print('Starting Serial Port Profile...')
+
+        if read_cb is None:
+            self.profile = Profile(bus, profile_path, self.read_cb,
+                                   debug=False)
+        else:
+            self.profile = Profile(bus, profile_path, read_cb,
+                                   debug=False)
+
+        manager.RegisterProfile(profile_path, server_uuid, opts)
+
+    def read_cb(self, value):
+        print(value)
+
+    def send(self, value):
+        self.profile.write_io(value)
+
+    def fd_available(self):
+        if self.profile.fd > 0:
+            return True
+        else:
+            return False
+
+    def get_conn_device(self):
+
+        return self.profile.conn_device
+
+    def start(self, stopping=False):
+        self.mainloop.run()
+
